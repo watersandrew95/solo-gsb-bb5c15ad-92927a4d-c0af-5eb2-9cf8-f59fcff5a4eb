@@ -563,4 +563,83 @@ except main.HTTPException as e:
 # 只读: 规划后原方案指标不变
 assert call("GET","/api/plan/2")["result"]["metrics"]["u1_mag_g_mm"]==m2
 print("batch-sequence validation/read-only OK")
+
+# ---- 逐管安全装载次序(只读, 子集 DP 精确求峰值最小次序) ----
+import math as _m2
+def sl_route(plan_id):
+    found = find("POST", f"/api/plan/{plan_id}/safe-loading")
+    return (found if isinstance(found, tuple) else (found, ()))
+def sl_call(plan_id, limit=None):
+    fn, args = sl_route(plan_id)
+    return fn(*args, types.SimpleNamespace(u1_limit_g_mm=limit))
+
+def _brute_loading(plan):
+    """全排列参考: (最小峰值, 升序裁决编号序列, 最优次序条数)。"""
+    pls=[p for p in plan["result"]["placements"] if p["slot"] is not None]
+    R=plan["request"]["radius_mm"]
+    nslots=len(plan["request"]["slots"])
+    best=None; seq=None; cnt=0
+    for perm in _it.permutations(pls):
+        ux=uy=0.0; pk=0.0
+        for p in perm:
+            a=_m2.radians(p["angle"]); ux+=p["mass"]*_m2.cos(a); uy+=p["mass"]*_m2.sin(a)
+            pk=max(pk, R*_m2.hypot(ux,uy))
+        s=tuple(p["tube_id"] for p in perm)
+        if best is None or pk<best-1e-9*max(1,pk,best):
+            best,seq,cnt=pk,s,1
+        elif abs(pk-best)<=1e-9*max(1,pk,best):
+            cnt+=1; seq=min(seq,s)
+    return best,list(seq),cnt
+
+sl_plan=call("GET","/api/plan/2")
+sl=sl_call(2)
+bp,bseq,bcnt=_brute_loading(sl_plan)
+assert abs(sl["peak_u1_mag_g_mm"]-bp)<1e-6,(sl["peak_u1_mag_g_mm"],bp)
+assert sl["order"]==bseq,(sl["order"],bseq)
+assert sl["optimal_order_count"]==bcnt,(sl["optimal_order_count"],bcnt)
+# 空转子起步, 每步一支; 累计峰值单调, 末步=最终布局 |U₁|
+assert len(sl["steps"])==sl_plan["result"]["total_tubes"]
+_cp=0.0
+for _st in sl["steps"]:
+    _cp=max(_cp,_st["u1_mag_g_mm"])
+    assert abs(_st["cumulative_peak_g_mm"]-_cp)<1e-9
+    assert _st["within_limit"] is None and _st["excess_g_mm"] is None
+assert abs(_cp-sl["peak_u1_mag_g_mm"])<1e-9
+assert abs(sl["final_u1_mag_g_mm"]
+           -sl_plan["result"]["metrics"]["u1_mag_g_mm"])<1e-6
+assert sl["initial"]["u1_mag_g_mm"]==0.0
+# 限值: 取峰值本身 -> 全程合格; 峰值-1 -> 必有超限步骤且峰值步超限
+sl_ok=sl_call(2, sl["peak_u1_mag_g_mm"])
+assert sl_ok["within_limit"] is True and sl_ok["over_limit_count"]==0
+sl_bad=sl_call(2, sl["peak_u1_mag_g_mm"]-1.0)
+assert sl_bad["within_limit"] is False
+assert sl_bad["peak_step"] in sl_bad["over_limit_steps"]
+# 限值不改变最优次序
+assert sl_bad["order"]==sl["order"]
+# 负限值 -> 400(桩 pydantic 不校验, 由业务逻辑拒绝)
+try:
+    sl_call(2,-0.1); raise SystemExit("should 400")
+except main.HTTPException as e:
+    assert e.status_code==400
+# 方案不存在 -> 404
+try:
+    sl_call(999); raise SystemExit("should 404")
+except main.HTTPException as e:
+    assert e.status_code==404
+# 超过 16 支 -> 明确拒绝(400)
+slots18=[{"index":i,"angle":360*i/18,"enabled":True} for i in range(18)]
+b17=dict(req_body); b17["name"]="17管超限方案"; b17["slot_count"]=18
+b17["slots"]=slots18; b17["tubes"]=[{"id":i,"mass":50.0} for i in range(1,18)]
+b17["restarts"]=2; b17["chain_steps"]=200
+rec17=call("POST","/api/plan",b17)
+assert rec17["result"]["total_tubes"]==17
+try:
+    sl_call(rec17["id"]); raise SystemExit("should 400")
+except main.HTTPException as e:
+    assert e.status_code==400 and "16" in e.detail
+# 只读: 装载规划后原方案指标不变
+assert call("GET","/api/plan/2")["result"]["metrics"]["u1_mag_g_mm"]==m2
+print("safe-loading peak=%.3f order=%s count=%d OK" % (
+    sl["peak_u1_mag_g_mm"],sl["order"],sl["optimal_order_count"]))
+
 print("BACKEND SMOKE TESTS PASS")

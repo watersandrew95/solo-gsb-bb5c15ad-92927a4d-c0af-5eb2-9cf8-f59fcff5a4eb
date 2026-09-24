@@ -255,9 +255,10 @@ function renderResult(record) {
   sum.innerHTML = r.summary;
   $("btnExport").disabled = false;
   $("btnCopy").disabled = false;
-  // 误差校核/振动校准只针对已保存方案: 未保存(草稿)时禁用
+  // 误差校核/振动校准/逐管装载只针对已保存方案: 未保存(草稿)时禁用
   $("btnWeighing").disabled = !(record.id !== null && record.id !== undefined);
   $("btnCalib").disabled = !(record.id !== null && record.id !== undefined);
+  $("btnLoading").disabled = !(record.id !== null && record.id !== undefined);
 
   drawRotor(r);
   renderPairs(r);
@@ -494,6 +495,7 @@ async function renderHistory() {
       syncHistoryButtons();
     };
     d.querySelector('[data-a="load"]').onclick = () => loadPlan(it.id);
+    d.querySelector('[data-a="loadseq"]').onclick = () => openLoadingDialog(it.id);
     d.querySelector('[data-a="weigh"]').onclick = () => openWeighingDialog(it.id);
     d.querySelector('[data-a="calib"]').onclick = () => openCalibDialog(it.id);
     d.querySelector('[data-a="export"]').onclick = () => { window.location = `/api/plan/${it.id}/export`; };
@@ -1075,6 +1077,171 @@ $("btnCalib").onclick = () => {
   }
 };
 $("btnCloseCalib").onclick = () => $("calibDialog").classList.remove("open");
+
+// ---------------------------------------------------------------------------
+// 逐管安全装载次序(只读, 基于一条已保存方案; 子集 DP, 至多 16 支)
+// ---------------------------------------------------------------------------
+const ldState = { planId: null, data: null };
+
+async function openLoadingDialog(id) {
+  $("btnLoading")?.blur();
+  ldState.planId = id;
+  $("ldLimit").value = "";
+  $("loadingResult").innerHTML =
+    '<p class="muted">填写可选的装载阶段限值后, 点击“规划装载次序”。</p>';
+  try {
+    const resp = await fetch(`/api/plan/${id}`);
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "方案读取失败");
+    ldState.data = data;
+    const placed = data.result.placements.filter(
+      (p) => p.slot !== null && p.slot !== undefined);
+    ldState.placedCount = placed.length;
+    $("loadingMeta").innerHTML =
+      `方案 <b>#${data.id} ${data.name}</b> · ${new Date(data.created_at).toLocaleString()} ·
+       R=${data.request.radius_mm}mm · ${data.result.config.rpm} rpm ·
+       已放置试管 <b>${placed.length}</b> 支
+       ${placed.length > 16 ? '· <span class="wc-hi">超过 16 支, 将明确拒绝</span>' : ""} ·
+       最终 |U₁|=${fmt(data.result.metrics.u1_mag_g_mm)} g·mm`;
+    $("loadingDialog").classList.add("open");
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+$("btnLdRun").onclick = async () => {
+  const btn = $("btnLdRun");
+  btn.disabled = true;
+  btn.textContent = "规划中…";
+  try {
+    const body = {};
+    const raw = $("ldLimit").value;
+    if (raw !== "") {
+      const lim = parseFloat(raw);
+      if (isNaN(lim) || lim < 0) { toast("限值必须为非负数, 或留空。", true); return; }
+      body.u1_limit_g_mm = lim;
+    }
+    const resp = await fetch(`/api/plan/${ldState.planId}/safe-loading`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "装载次序规划失败");
+    renderLoadingResult(data);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "规划装载次序";
+  }
+};
+
+function renderLoadingResult(d) {
+  const box = $("loadingResult");
+  const hasLimit = d.u1_limit_g_mm !== null && d.u1_limit_g_mm !== undefined;
+  let verdict;
+  if (!hasLimit) {
+    verdict = `<div class="wc-note">未填写装载阶段限值, 仅给出最小全过程峰值
+      <b>${fmt(d.peak_u1_mag_g_mm)}</b> g·mm(第 ${d.peak_step} 步达到), 不做超限判定。</div>`;
+  } else if (d.within_limit) {
+    verdict = `<div class="wc-ok">✔ <b>全程合格</b>: 最小峰值 |U₁|=${fmt(d.peak_u1_mag_g_mm)} g·mm
+      ≤ 装载阶段限值 ${fmt(d.u1_limit_g_mm)} g·mm, 全部 ${d.tube_count} 个中间状态均不超限。</div>`;
+  } else {
+    verdict = `<div class="wc-bad">✘ <b>存在超限步骤</b>: 即使采用最优装载次序,
+      峰值 |U₁|=${fmt(d.peak_u1_mag_g_mm)} g·mm &gt; 限值 ${fmt(d.u1_limit_g_mm)} g·mm;
+      超限步骤: <b>${d.over_limit_steps.join("、")}</b>(共 ${d.over_limit_count} 步)。
+      建议放宽限值、调整装料节奏或重新配平。</div>`;
+  }
+  const tie = d.optimal_order_count > 1
+    ? `达到最小峰值的装载次序共 <b>${d.optimal_order_count.toLocaleString()}</b> 条, 已按试管编号序列升序裁决。`
+    : "达到最小峰值的装载次序唯一。";
+
+  const orderLine = `<div class="rowline" style="flex-wrap:wrap;gap:6px;margin:6px 0 8px">
+    <span class="small">空转子</span>
+    ${d.order.map((t, i) => {
+      const st = d.steps[i];
+      const over = st.within_limit === false;
+      return `<span class="muted">→</span>
+        <span class="badge" style="${over ? "color:var(--bad);border-color:var(--bad)" : ""}"
+          title="槽位 ${st.slot} (${fmt(st.angle_deg, 1)}°), 当步 |U₁|=${fmt(st.u1_mag_g_mm)}">T${t}</span>`;
+    }).join("")}
+  </div>`;
+
+  const rows = d.steps.map((s) => {
+    const isPeak = s.step === d.peak_step;
+    const limitCell = hasLimit
+      ? (s.within_limit
+          ? '<span class="delta-down">合格</span>'
+          : '<span class="delta-up">超限</span>')
+      : "–";
+    return `<tr${isPeak ? ' style="background:#3a2a1255"' : ""}>
+      <td>${s.step}${isPeak ? ' <span class="wc-hi">★峰值</span>' : ""}</td>
+      <td><b>T${s.tube_id}</b></td>
+      <td>${s.slot} <span class="small">(${fmt(s.angle_deg, 1)}°)</span></td>
+      <td>${fmt(s.mass_g, 2)}</td>
+      <td style="text-align:right" class="${isPeak ? "wc-hi" : ""}"><b>${fmt(s.u1_mag_g_mm)}</b></td>
+      <td style="text-align:right">${fmt(s.u1_angle_deg, 1)}°</td>
+      <td style="text-align:right">${fmt(s.cumulative_peak_g_mm)}</td>
+      <td style="text-align:right">${fmt(s.centrifugal_force_n, 3)}</td>
+      <td style="text-align:right">${limitCell}</td>
+      <td style="text-align:right">${s.excess_g_mm === null || s.excess_g_mm === undefined ? "–"
+        : (s.excess_g_mm > 0 ? `<span class="delta-up">+${fmt(s.excess_g_mm)}</span>` : "0")}</td>
+    </tr>`;
+  }).join("");
+
+  const unplaced = d.unplaced_tube_ids && d.unplaced_tube_ids.length
+    ? `<div class="small" style="margin:4px 0">方案中未放置的试管不参与装载:
+        ${d.unplaced_tube_ids.map((t) => `T${t}`).join("、")}</div>`
+    : "";
+
+  box.innerHTML = `
+    ${verdict}
+    <table class="cmp-table">
+      <thead><tr><th>指标</th><th style="text-align:right">数值</th></tr></thead>
+      <tbody>
+        <tr><td>全过程最小峰值 |U₁|</td>
+          <td style="text-align:right" class="wc-hi"><b>${fmt(d.peak_u1_mag_g_mm)}</b> g·mm
+          (第 ${d.peak_step} / ${d.tube_count} 步)</td></tr>
+        <tr><td>峰值处 U₁ 方向</td>
+          <td style="text-align:right">${fmt(d.peak_u1_angle_deg, 1)}°</td></tr>
+        <tr><td>峰值对应离心合力 (${d.rpm} rpm)</td>
+          <td style="text-align:right">${fmt(d.peak_centrifugal_force_n, 3)} N</td></tr>
+        <tr><td>最终布局 |U₁|(装完后, 应与原方案一致)</td>
+          <td style="text-align:right">${fmt(d.final_u1_mag_g_mm)} g·mm
+          (${fmt(d.final_centrifugal_force_n, 3)} N)</td></tr>
+        ${hasLimit ? `<tr><td>装载阶段限值 / 超限步骤数</td>
+          <td style="text-align:right">${fmt(d.u1_limit_g_mm)} g·mm / ${d.over_limit_count} 步</td></tr>` : ""}
+      </tbody>
+    </table>
+    <div class="small" style="margin:6px 0 2px">${tie}</div>
+    ${orderLine}
+    ${unplaced}
+    <table class="cmp-table wc-table">
+      <thead><tr><th>步骤</th><th>装入管号</th><th>槽位 / 角度</th><th>质量(g)</th>
+        <th style="text-align:right">当步 |U₁|</th><th style="text-align:right">U₁ 方向</th>
+        <th style="text-align:right">累计峰值</th>
+        <th style="text-align:right">离心力(N)</th>
+        <th style="text-align:right">限值判定</th><th style="text-align:right">超出量</th></tr></thead>
+      <tbody>
+        <tr class="small"><td>0</td><td>空转子</td><td>–</td><td>–</td>
+          <td style="text-align:right">0</td><td style="text-align:right">–</td>
+          <td style="text-align:right">0</td><td style="text-align:right">0.000</td>
+          <td style="text-align:right">${hasLimit ? '<span class="delta-down">合格</span>' : "–"}</td>
+          <td style="text-align:right">–</td></tr>
+        ${rows}
+      </tbody>
+    </table>
+    <div class="small" style="margin-top:6px">${d.method}。${d.note} 方案 #${d.plan.id} 未被修改。</div>`;
+}
+
+$("btnLoading").onclick = () => {
+  if (state.record && state.record.id !== null && state.record.id !== undefined) {
+    openLoadingDialog(state.record.id);
+  } else {
+    toast("请先从历史方案载入一条已保存方案, 或先计算并保存方案。", true);
+  }
+};
+$("btnCloseLoading").onclick = () => $("loadingDialog").classList.remove("open");
 
 // ---------------------------------------------------------------------------
 // 标签页 & 初始化

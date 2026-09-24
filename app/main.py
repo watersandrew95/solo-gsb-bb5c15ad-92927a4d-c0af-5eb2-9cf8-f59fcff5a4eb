@@ -19,6 +19,7 @@ from .balancer import run_plan
 from .batch import plan_batch_sequence
 from .calibration import predict_single_weight_balancing
 from .compare import compare_plans
+from .loading import plan_safe_loading
 from .weighing import worst_case_u1
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -114,6 +115,11 @@ class BatchSequenceRequest(BaseModel):
     # 参与批次换装的已保存方案 ID(2~10 条, 每条至多出现一次);
     # 执行次序由服务端精确优化, 与传入顺序无关
     plan_ids: list[int] = Field(min_length=2, max_length=10)
+
+
+class SafeLoadingRequest(BaseModel):
+    # 装载阶段一阶不平衡量限值(g·mm); 留空则只优化与展示, 不做超限判定
+    u1_limit_g_mm: Optional[float] = Field(default=None, ge=0)
 
 
 class PlanRequest(BaseModel):
@@ -325,6 +331,40 @@ def batch_sequence(req: BatchSequenceRequest) -> dict[str, Any]:
         return plan_batch_sequence(plans)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/plan/{plan_id}/safe-loading")
+def safe_loading(plan_id: int, req: SafeLoadingRequest) -> dict[str, Any]:
+    """逐管安全装载次序规划(只读): 空转子起步, 每步一支, 保持最终槽位不变。
+
+    各管质量、槽角与半径只读取自已保存方案; 用子集动态规划(2^n 状态,
+    至多 16 支试管)精确求全过程峰值 |U₁| 最小的装载次序, 同峰值按试管
+    编号序列升序裁决。u1_limit_g_mm 为装载阶段限值, 逐中间状态标注超限
+    步骤, 不影响优化结果。结果不保存、不覆盖原方案; 超过 16 支返回 400。
+    """
+    plan = _row_to_plan(_load_plan_row(plan_id))
+    try:
+        loading = plan_safe_loading(plan, u1_limit_g_mm=req.u1_limit_g_mm)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    rpm = float(plan["result"]["config"]["rpm"])
+    omega = 2.0 * math.pi * rpm / 60.0
+
+    def _force(mag: float) -> float:
+        return omega ** 2 * mag * 1e-6
+
+    loading["rpm"] = rpm
+    loading["angular_velocity_rad_s"] = omega
+    loading["peak_centrifugal_force_n"] = _force(loading["peak_u1_mag_g_mm"])
+    loading["final_centrifugal_force_n"] = _force(loading["final_u1_mag_g_mm"])
+    for step in loading["steps"]:
+        step["centrifugal_force_n"] = _force(step["u1_mag_g_mm"])
+    loading["plan"] = {
+        "id": plan["id"],
+        "name": plan["name"],
+        "created_at": plan["created_at"],
+    }
+    return loading
 
 
 @app.delete("/api/plan/{plan_id}")
