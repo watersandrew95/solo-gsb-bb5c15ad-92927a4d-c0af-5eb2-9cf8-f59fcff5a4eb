@@ -19,6 +19,7 @@ from .balancer import run_plan
 from .batch import plan_batch_sequence
 from .calibration import predict_single_weight_balancing
 from .compare import compare_plans
+from .loading import plan_loading_sequence
 from .weighing import worst_case_u1
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -114,6 +115,11 @@ class BatchSequenceRequest(BaseModel):
     # 参与批次换装的已保存方案 ID(2~10 条, 每条至多出现一次);
     # 执行次序由服务端精确优化, 与传入顺序无关
     plan_ids: list[int] = Field(min_length=2, max_length=10)
+
+
+class LoadingSequenceRequest(BaseModel):
+    # 装载阶段一阶不平衡量限值(g·mm), 可空; 非空时必须非负
+    u1_limit_g_mm: Optional[float] = Field(default=None, ge=0)
 
 
 class PlanRequest(BaseModel):
@@ -439,6 +445,23 @@ def vibration_calibration(plan_id: int, req: VibrationCalibrationRequest) -> dic
         "created_at": plan["created_at"],
     }
     return calib
+
+
+@app.post("/api/plan/{plan_id}/loading-sequence")
+def loading_sequence(plan_id: int, req: LoadingSequenceRequest) -> dict[str, Any]:
+    """对已保存方案规划逐管安全装载次序(只读): 空转子起步, 每步只装一支。
+
+    各管最终槽位与方案完全一致; 按方案中的质量、槽角与半径计算各中间
+    状态的 |U₁|, 用子集动态规划(2^n, n ≤ 16)精确求全过程峰值 |U₁| 最小
+    的装载次序, 并列最优按试管编号序列升序裁决。可填写装载阶段限值,
+    逐步返回装入管号、槽位、当步 |U₁|、累计峰值与超限步骤; 超过 16 支
+    试管明确拒绝(400)。结果不保存、不覆盖原方案。
+    """
+    plan = _row_to_plan(_load_plan_row(plan_id))
+    try:
+        return plan_loading_sequence(plan, u1_limit_g_mm=req.u1_limit_g_mm)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------

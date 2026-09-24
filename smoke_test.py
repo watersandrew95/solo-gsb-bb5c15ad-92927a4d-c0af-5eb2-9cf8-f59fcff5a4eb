@@ -563,4 +563,91 @@ except main.HTTPException as e:
 # 只读: 规划后原方案指标不变
 assert call("GET","/api/plan/2")["result"]["metrics"]["u1_mag_g_mm"]==m2
 print("batch-sequence validation/read-only OK")
+
+# ---- 逐管安全装载(只读, 子集 DP 精确求最小峰值次序) ----
+def ls_call(plan_id, limit="KEEP"):
+    found = find("POST", f"/api/plan/{plan_id}/loading-sequence")
+    fn, args = (found if isinstance(found, tuple) else (found, ()))
+    req = types.SimpleNamespace(
+        u1_limit_g_mm=(None if limit == "KEEP" else limit))
+    return fn(*args, req)
+
+def _brute_loading(plan):
+    """全排列参考: (最小峰值, 升序裁决后的试管编号序列, 最优次序条数)。"""
+    res = plan["result"]; R = res["config"]["radius_mm"]
+    vec = {}
+    for p in res["placements"]:
+        if p["slot"] is None: continue
+        a = _math.radians(p["angle"])
+        vec[p["tube_id"]] = R * p["mass"] * complex(
+            _math.cos(a), _math.sin(a))
+    ids = sorted(vec)
+    best = None; seq = None; cnt = 0
+    for perm in _it.permutations(ids):
+        ux = uy = 0.0; pk = 0.0
+        for tid in perm:
+            v = vec[tid]; ux += v.real; uy += v.imag
+            pk = max(pk, _math.hypot(ux, uy))
+        if best is None or pk < best - 1e-9 * max(1.0, best):
+            best, seq, cnt = pk, perm, 1
+        elif pk <= best + 1e-9 * max(1.0, best):
+            cnt += 1; seq = min(seq, perm)
+    return best, list(seq), cnt
+
+# plan#2 共 7 支试管, 与全排列暴力枚举对照
+plan2 = call("GET", "/api/plan/2")
+ls = ls_call(2)
+b_best, b_seq, b_cnt = _brute_loading(plan2)
+assert ls["tube_count"] == 7 and len(ls["steps"]) == 7
+assert abs(ls["peak_u1_g_mm"] - b_best) < 1e-6 * max(1.0, b_best), (ls["peak_u1_g_mm"], b_best)
+assert ls["order"] == b_seq, (ls["order"], b_seq)
+assert ls["optimal_order_count"] == b_cnt, (ls["optimal_order_count"], b_cnt)
+assert ls["tie_broken"] == (b_cnt > 1)
+# 逐步: 每步恰装一支且最终槽位与方案一致; 累计峰值单调, 末值=最小峰值
+plan_slots = {p["tube_id"]: p["slot"] for p in plan2["result"]["placements"]}
+assert [s["tube_id"] for s in ls["steps"]] == b_seq
+assert all(s["slot"] == plan_slots[s["tube_id"]] for s in ls["steps"])
+peaks = [s["peak_so_far_g_mm"] for s in ls["steps"]]
+assert peaks == sorted(peaks)
+assert abs(peaks[-1] - ls["peak_u1_g_mm"]) < 1e-9
+# 最终 |U₁| 与方案标称一致
+assert abs(ls["steps"][-1]["u1_mag_g_mm"] - m2) < 1e-6
+assert abs(ls["final_u1_g_mm"] - m2) < 1e-6
+# 限值判定: 峰值处合格 / 峰值-1 超限且列出超限步 / 不填不判定
+ls_ok = ls_call(2, ls["peak_u1_g_mm"])
+assert ls_ok["within_limit"] is True and ls_ok["exceeded_steps"] == []
+assert all(s["exceeds_limit"] is False for s in ls_ok["steps"])
+ls_bad = ls_call(2, max(0.0, ls["peak_u1_g_mm"] - 1.0))
+assert ls_bad["within_limit"] is False and ls_bad["exceeded_steps"]
+assert ls_bad["exceeded_count"] == len(ls_bad["exceeded_steps"])
+hit = [s["seq"] for s in ls_bad["steps"] if s["exceeds_limit"]]
+assert hit == ls_bad["exceeded_steps"]
+ls_nl = ls_call(2)
+assert ls_nl["within_limit"] is None and ls_nl["u1_limit_g_mm"] is None
+assert all(s["exceeds_limit"] is None for s in ls_nl["steps"])
+print("loading-sequence peak=%.3f order=%s count=%d OK" % (
+    ls["peak_u1_g_mm"], ls["order"], ls["optimal_order_count"]))
+
+# 方案不存在 -> 404; 负限值 -> 400
+try:
+    ls_call(999); raise SystemExit("should 404")
+except main.HTTPException as e:
+    assert e.status_code == 404
+try:
+    ls_call(2, -1.0); raise SystemExit("should 400")
+except main.HTTPException as e:
+    assert e.status_code == 400
+# 超过 16 支 -> 明确拒绝(400)
+big = dict(req_body); big["name"] = "17支方案"
+big["slot_count"] = 24
+big["slots"] = [{"index": i, "angle": i * 15.0, "enabled": True} for i in range(24)]
+big["tubes"] = [{"id": i + 1, "mass": 10.0 + i} for i in range(17)]
+recb = call("POST", "/api/plan", big)
+try:
+    ls_call(recb["id"]); raise SystemExit("should 400")
+except main.HTTPException as e:
+    assert e.status_code == 400 and "16" in str(e.detail), e.detail
+# 只读: 规划后原方案指标不变
+assert call("GET", "/api/plan/2")["result"]["metrics"]["u1_mag_g_mm"] == m2
+print("loading-sequence validation/read-only OK")
 print("BACKEND SMOKE TESTS PASS")

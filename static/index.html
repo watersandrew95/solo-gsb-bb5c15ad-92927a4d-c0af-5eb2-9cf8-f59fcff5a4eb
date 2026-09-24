@@ -204,6 +204,7 @@ th{color:var(--mut);font-weight:500}
       <div class="spacer" style="flex:1"></div>
       <button id="btnWeighing" disabled title="对已保存方案做称重误差校核(只读)">称重误差校核</button>
       <button id="btnCalib" disabled title="对已保存方案做实测振动校准(只读, 影响系数法)">实测振动校准</button>
+      <button id="btnLoading" disabled title="对已保存方案规划逐管安全装载次序(只读, 子集动态规划)">逐管安全装载</button>
       <button id="btnExport" disabled>导出 JSON</button>
       <button id="btnCopy" disabled>复制 JSON</button>
     </div>
@@ -364,6 +365,29 @@ th{color:var(--mut);font-weight:500}
       <button id="btnCbRun" class="primary">计算影响系数并预测</button>
     </div>
     <div id="calibResult" style="margin-top:8px"></div>
+  </div>
+</div>
+
+<div id="loadingDialog" class="dialog">
+  <div class="box wider">
+    <div class="rowline"><h2 style="margin:0">逐管安全装载</h2><div style="flex:1"></div>
+      <button id="btnCloseLoading" class="ghost">关闭</button></div>
+    <div class="wc-note">从<b>空转子</b>开始, 每步只装入<b>一支</b>试管, 各管最终槽位与该方案完全一致。
+      服务端按方案中的质量、槽角与半径计算各中间状态的 |U₁|, 用<b>子集动态规划</b>(2ⁿ, n≤16)
+      精确求<b>全过程峰值 |U₁| 最小</b>的装载次序; 并列最优按试管编号序列升序裁决。
+      可填写装载阶段限值, 逐步给出装入管号、槽位、当步 |U₁|、累计峰值与超限步骤。
+      超过 16 支试管将被明确拒绝。结果为<b>只读</b>, 不保存、不覆盖原方案。</div>
+    <div id="loadingMeta" class="small" style="margin:4px 0 8px"></div>
+    <div class="rowline" style="gap:10px;flex-wrap:wrap;margin-bottom:8px">
+      <div style="flex:1;min-width:220px">
+        <label>装载阶段限值 |U₁| (g·mm), 留空则只计算不判定</label>
+        <input id="ldLimit" type="number" min="0" step="any" placeholder="例如 5000">
+      </div>
+      <div style="align-self:flex-end">
+        <button id="btnLdRun" class="primary">规划装载次序</button>
+      </div>
+    </div>
+    <div id="loadingResult" style="margin-top:6px"></div>
   </div>
 </div>
 
